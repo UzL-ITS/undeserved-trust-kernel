@@ -66,6 +66,7 @@ enum sev_cmd {
 	SEV_CMD_LAUNCH_MEASURE		= 0x033,
 	SEV_CMD_LAUNCH_UPDATE_SECRET	= 0x034,
 	SEV_CMD_LAUNCH_FINISH		= 0x035,
+	SEV_CMD_ATTESTATION 		= 0X036,
 
 	/* Guest migration commands (outgoing) */
 	SEV_CMD_SEND_START		= 0x040,
@@ -85,6 +86,31 @@ enum sev_cmd {
 
 	SEV_CMD_MAX,
 };
+
+/**
+ * struct sev_data_attestation
+ */ 
+struct sev_data_attestation {
+	u32 handle; /* In, guest handle */
+	u32 reserved; /* In, must be zero*/
+	u64 paddr; /* In, will be fille with attestation report*/
+	u8 mnonce[16]; /*In */
+	u32 length; /*In, length of area provided for the asstestation report*/
+} __packed;
+
+
+/**
+ * struct sev_data_attestation_report
+ */
+struct sev_data_attestation_report {
+	u8 mnonce[16];
+	u8 launch_digest[32];
+	u32 policy;
+	u32 sig_usage;
+	u32 sig_algo;
+	u32 reserved;
+	u8 sig1[143];
+} __packed;
 
 /**
  * struct sev_data_init - INIT command parameters
