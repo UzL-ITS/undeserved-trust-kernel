@@ -1088,7 +1088,9 @@ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu)
 	if( launch_attack_config.current_cpuid_call_count < 100 ) {
 		printk("cpuid call nr %d\n",launch_attack_config.current_cpuid_call_count);
 	}
-	launch_attack_config.current_cpuid_call_count++;
+	if( launch_attack.config.active) {
+		launch_attack_config.current_cpuid_call_count++;
+	}
 	
 	return kvm_skip_emulated_instruction(vcpu);
 }

